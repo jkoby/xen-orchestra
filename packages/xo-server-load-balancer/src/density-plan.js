@@ -15,13 +15,19 @@ export default class DensityPlan extends Plan {
   }
 
   async execute() {
-    const results = await this._findHostsToOptimize()
+    this._processAntiAffinity()
+
+    const hosts = this._getHosts()
+    const results = await this._getHostStatsAverages({
+      hosts,
+      toOptimizeOnly: true
+    })
 
     if (!results) {
       return
     }
 
-    const { hosts, toOptimize } = results
+    const { toOptimize } = results
 
     let { averages: hostsAverages } = results
 
@@ -94,8 +100,8 @@ export default class DensityPlan extends Plan {
 
     debug(`Try to optimize Host (${hostId}).`)
 
-    const vms = await this._getVms(hostId)
-    const vmsAverages = await this._getVmsAverages(vms, host)
+    const vms = filter(this._getAllRunningVms(), vm => vm.$container === hostId)
+    const vmsAverages = await this._getVmsAverages(vms, { [host.id]: host })
 
     for (const vm of vms) {
       if (!vm.xenTools) {

@@ -1,4 +1,5 @@
-import { filter, includes, map as mapToArray, size } from 'lodash'
+import { filter, groupBy, includes, isEmpty, keyBy, map as mapToArray, maxBy, minBy, size, sortBy } from 'lodash'
+import { inspect } from 'util'
 
 import { EXECUTION_DELAY, debug } from './utils'
 
@@ -94,7 +95,7 @@ function setRealCpuAverageOfVms(vms, vmsAverages, nCpus) {
 // ===================================================================
 
 export default class Plan {
-  constructor(xo, name, poolIds, { excludedHosts, thresholds } = {}) {
+  constructor(xo, name, poolIds, { excludedHosts, thresholds, antiAffinityTags } = {}) {
     this.xo = xo
     this._name = name
     this._poolIds = poolIds
@@ -107,6 +108,7 @@ export default class Plan {
         critical: numberOrDefault(thresholds && thresholds.memoryFree, DEFAULT_CRITICAL_THRESHOLD_MEMORY_FREE) * 1024,
       },
     }
+    this._antiAffinityTags = antiAffinityTags
 
     for (const key in this._thresholds) {
       const attr = this._thresholds[key]
@@ -130,36 +132,35 @@ export default class Plan {
   // Get hosts to optimize.
   // ===================================================================
 
-  async _findHostsToOptimize() {
-    const hosts = this._getHosts()
+  async _getHostStatsAverages({ hosts, toOptimizeOnly = false }) {
     const hostsStats = await this._getHostsStats(hosts, 'minutes')
 
-    // Check if a ressource's utilization exceeds threshold.
     const avgNow = computeRessourcesAverage(hosts, hostsStats, EXECUTION_DELAY)
-    let toOptimize = this._checkRessourcesThresholds(hosts, avgNow)
-
-    // No ressource's utilization problem.
-    if (toOptimize.length === 0) {
-      debug('No hosts to optimize.')
-      return
+    let toOptimize
+    if (toOptimizeOnly) {
+      // Check if a ressource utilization exceeds threshold.
+      toOptimize = this._checkRessourcesThresholds(hosts, avgNow)
+      if (toOptimize.length === 0) {
+        debug('No hosts to optimize.')
+        return
+      }
     }
 
-    // Check in the last 30 min interval with ratio.
     const avgBefore = computeRessourcesAverage(hosts, hostsStats, MINUTES_OF_HISTORICAL_DATA)
     const avgWithRatio = computeRessourcesAverageWithWeight(avgNow, avgBefore, 0.75)
 
-    toOptimize = this._checkRessourcesThresholds(toOptimize, avgWithRatio)
-
-    // No ressource's utilization problem.
-    if (toOptimize.length === 0) {
-      debug('No hosts to optimize.')
-      return
+    if (toOptimizeOnly) {
+      // Check in the last 30 min interval with ratio.
+      toOptimize = this._checkRessourcesThresholds(toOptimize, avgWithRatio)
+      if (toOptimize.length === 0) {
+        debug('No hosts to optimize.')
+        return
+      }
     }
 
     return {
       toOptimize,
       averages: avgWithRatio,
-      hosts,
     }
   }
 
@@ -197,10 +198,10 @@ export default class Plan {
     )
   }
 
-  async _getVms(hostId) {
+  _getAllRunningVms() {
     return filter(
       this.xo.getObjects(),
-      object => object.type === 'VM' && object.power_state === 'Running' && object.$container === hostId
+      object => object.type === 'VM' && object.power_state === 'Running'
     )
   }
 
@@ -244,7 +245,7 @@ export default class Plan {
     return vmsStats
   }
 
-  async _getVmsAverages(vms, host) {
+  async _getVmsAverages(vms, hosts) {
     const vmsStats = await this._getVmsStats(vms, 'minutes')
     const vmsAverages = computeRessourcesAverageWithWeight(
       computeRessourcesAverage(vms, vmsStats, EXECUTION_DELAY),
@@ -253,8 +254,162 @@ export default class Plan {
     )
 
     // Compute real CPU usage. Virtuals cpus to reals cpus.
-    setRealCpuAverageOfVms(vms, vmsAverages, host.CPUs.cpu_count)
+    for (const [hostId, hostVms] of Object.entries(groupBy(vms, '$container'))) {
+      setRealCpuAverageOfVms(hostVms, vmsAverages, hosts[hostId].CPUs.cpu_count)
+    }
 
     return vmsAverages
+  }
+
+  // ===================================================================
+  // Anti-affinity helpers
+  // ===================================================================
+
+  async _processAntiAffinity() {
+    if (!this._antiAffinityTags.length) {
+      return
+    }
+
+    const allHosts = await this._getHosts()
+    if (allHosts.length <= 1) {
+      return
+    }
+    const idToHost = keyBy(allHosts, 'id')
+
+    const allVms = filter(
+      this._getAllRunningVms(),
+      vm => vm.$container in idToHost
+    )
+    const taggedHosts = Object.values(this._getAntiAffinityTaggedHosts(allHosts, allVms))
+
+    // 1. Check if we must migrate VMs...
+    const tagsDiff = {}
+    for (const watchedTag of this._antiAffinityTags) {
+      const getCount = fn => fn(taggedHosts, host => host.tags[watchedTag]).tags[watchedTag]
+      const diff = getCount(maxBy) - getCount(minBy)
+      if (diff > 1) {
+        tagsDiff[watchedTag] = diff - 1
+      }
+    }
+
+    if (isEmpty(tagsDiff)) {
+      return
+    }
+
+    // 2. Migrate!
+    debug('Try to apply anti-affinity policy.')
+    debug(`VM tag count per host: ${inspect(taggedHosts, { depth: null })}.`)
+    debug(`Tags diff: ${inspect(tagsDiff, { depth: null })}.`)
+
+    const vmsAverages = await this._getVmsAverages(allVms, idToHost)
+    const { averages: hostsAverages } = this._getHostStatsAverages({ hosts: allHosts })
+
+    const promises = []
+
+    for (const tag in tagsDiff) {
+      while (true) {
+        // 2.a. Find source host from which to migrate.
+        const sources = sortBy(
+          filter(taggedHosts, host => host.tags[tag] > 1),
+          host => host.tags[tag]
+        )
+        if (!sources.length) {
+          break // Nothing to migrate!
+        }
+        const srcHost = sources[sources.length - 1]
+
+        // 2.b. Find destination host, ideally it would be interesting to migrate in the same pool.
+        const destinations = sortBy(
+          filter(taggedHosts, host => host.id !== srcHost.id),
+          host => host.tags[tag],
+          host => host.poolId !== srcHost.poolId
+        )
+        if (!destinations.length) {
+          break // Cannot find a valid destination.
+        }
+        const destHost = destinations[0]
+
+        // 2.c. Build VM list to migrate.
+        // We try to migrate VMs with the targeted tag and with the fewest watched tags.
+        const vms = sortBy(
+          filter(srcHost.vms, vm => vm.tags.includes(tag)),
+          vm => vm.tags.length
+        )
+
+        debug(`Tagged VM ("${tag}") candidates to migrate from host ${srcHost.id}: ${inspect(mapToArray(vms, 'id'))}.`)
+        const vm = this._getAntiAffinityVmToMigrate(vms, vmsAverages, hostsAverages, taggedHosts)
+        if (!vm) {
+          break // If we can't find a VM to migrate, go to the next tag!
+        }
+        debug(`Migrate VM (${vm.id}) to Host (${destHost.id}) from Host (${srcHost.id}).`)
+
+        for (const tag of vm.tags) {
+          if (this._antiAffinityTags.includes(tag)) {
+            srcHost.tags[tag]--
+            destHost.tags[tag]++
+          }
+        }
+
+        delete srcHost.vms[vm.id]
+
+        // TODO: Remove
+        break
+        /* eslint-disable-next-line no-unreachable */
+        const destination = idToHost[destHost.id]
+        promises.push(this.xo.getXapi(idToHost[srcHost.id]).migrateVm(
+          vm._xapiId, this.xo.getXapi(destination), destination._xapiId
+        ))
+      }
+    }
+
+    // 3. Done!
+    debug(`VM tag count per host after migration: ${inspect(taggedHosts, { depth: null })}.`)
+    await Promise.all(promises)
+  }
+
+  _getAntiAffinityTaggedHosts(hosts, vms) {
+    const taggedHosts = {}
+    for (const host of hosts) {
+      const tags = {}
+      for (const tag of this._antiAffinityTags) {
+        tags[tag] = 0
+      }
+
+      const taggedHost = taggedHosts[host.id] = {
+        id: host.id,
+        poolId: host.$poolId,
+        tags,
+        vms: {}
+      }
+
+      // Hide properties when util.inspect is used.
+      for (const property of ['id', 'poolId', 'vms']) {
+        Object.defineProperty(taggedHost, property, { enumerable: false })
+      }
+    }
+
+    for (const vm of vms) {
+      const hostId = vm.$container
+      if (!(hostId in taggedHosts)) {
+        continue
+      }
+
+      const taggedHost = taggedHosts[hostId]
+
+      for (const tag of vm.tags) {
+        if (this._antiAffinityTags.includes(tag)) {
+          taggedHost.tags[tag]++
+          taggedHost.vms[vm.id] = vm
+        }
+      }
+    }
+
+    return taggedHosts
+  }
+
+  _getAntiAffinityVmToMigrate(vms, vmsAverages, hostsAverages, taggedHosts) {
+    // At this point the VMs must be ordered from the smallest number of tags to the largest.
+    // TODO: Ask to performance algorithm to sort VMs to reduce performance impact.
+    return vms[0]
   }
 }

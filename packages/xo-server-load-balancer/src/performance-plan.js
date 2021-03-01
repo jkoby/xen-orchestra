@@ -45,14 +45,19 @@ export default class PerformancePlan extends Plan {
       console.error(error)
     }
 
-    const results = await this._findHostsToOptimize()
+    this._processAntiAffinity()
+
+    const hosts = this._getHosts()
+    const results = await this._getHostStatsAverages({
+      hosts,
+      toOptimizeOnly: true
+    })
 
     if (!results) {
       return
     }
 
     const { averages, toOptimize } = results
-    const { hosts } = results
 
     toOptimize.sort((a, b) => {
       a = averages[a.id]
@@ -78,8 +83,8 @@ export default class PerformancePlan extends Plan {
   }
 
   async _optimize({ exceededHost, hosts, hostsAverages }) {
-    const vms = await this._getVms(exceededHost.id)
-    const vmsAverages = await this._getVmsAverages(vms, exceededHost)
+    const vms = filter(this._getAllRunningVms(), vm => vm.$container === exceededHost.id)
+    const vmsAverages = await this._getVmsAverages(vms, { [exceededHost.id]: exceededHost })
 
     // Sort vms by cpu usage. (lower to higher)
     vms.sort((a, b) => vmsAverages[b.id].cpu - vmsAverages[a.id].cpu)

@@ -33,7 +33,7 @@ export const configurationSchema = {
           },
 
           mode: {
-            enum: ['Performance mode', 'Density mode'],
+            enum: ['Performance mode', 'Density mode', 'Simple mode'],
             title: 'Mode',
           },
 
@@ -73,6 +73,17 @@ export const configurationSchema = {
             items: {
               type: 'string',
               $type: 'Host',
+            },
+          },
+
+          antiAffinityTags: {
+            type: 'array',
+            title: 'Anti-affinity tags',
+            description: 'list of VM tags to force place VMs on different hosts',
+
+            items: {
+              type: 'string',
+              $type: 'Tag',
             },
           },
         },
