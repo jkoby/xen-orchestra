@@ -303,9 +303,12 @@ export default class Plan {
 
     const promises = []
 
+    // TODO: Use another loop to continue until tagsDiff becomes empty.
+
     for (const tag in tagsDiff) {
       while (true) {
         // 2.a. Find source host from which to migrate.
+        // TODO: Find host with the most memory used.
         const sources = sortBy(
           filter(taggedHosts, host => host.tags[tag] > 1),
           host => host.tags[tag]
@@ -316,6 +319,7 @@ export default class Plan {
         const srcHost = sources[sources.length - 1]
 
         // 2.b. Find destination host, ideally it would be interesting to migrate in the same pool.
+        // TODO: Find host with the least memory used.
         const destinations = sortBy(
           filter(taggedHosts, host => host.id !== srcHost.id),
           host => host.tags[tag],
@@ -334,7 +338,7 @@ export default class Plan {
         )
 
         debug(`Tagged VM ("${tag}") candidates to migrate from host ${srcHost.id}: ${inspect(mapToArray(vms, 'id'))}.`)
-        const vm = this._getAntiAffinityVmToMigrate(vms, vmsAverages, hostsAverages, taggedHosts)
+        const vm = this._getAntiAffinityVmToMigrate({ vms, vmsAverages, hostsAverages, taggedHosts, srcHost, destHost })
         if (!vm) {
           break // If we can't find a VM to migrate, go to the next tag!
         }
@@ -347,6 +351,7 @@ export default class Plan {
           }
         }
 
+        // TODO: Update stats.
         delete srcHost.vms[vm.id]
 
         // TODO: Remove
@@ -380,7 +385,7 @@ export default class Plan {
       }
 
       // Hide properties when util.inspect is used.
-      for (const property of ['id', 'poolId', 'vms']) {
+      for (const property of ['poolId', 'vms']) {
         Object.defineProperty(taggedHost, property, { enumerable: false })
       }
     }
@@ -404,7 +409,14 @@ export default class Plan {
     return taggedHosts
   }
 
-  _getAntiAffinityVmToMigrate(vms, vmsAverages, hostsAverages, taggedHosts) {
+  _getAntiAffinityVmToMigrate({
+    vms,
+    vmsAverages,
+    hostsAverages,
+    taggedHosts,
+    srcHost,
+    destHost
+  }) {
     // At this point the VMs must be ordered from the smallest number of tags to the largest.
     // TODO: Ask to performance algorithm to sort VMs to reduce performance impact.
     return vms[0]
