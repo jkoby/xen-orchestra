@@ -276,10 +276,7 @@ export default class Plan {
     }
     const idToHost = keyBy(allHosts, 'id')
 
-    const allVms = filter(
-      this._getAllRunningVms(),
-      vm => vm.$container in idToHost
-    )
+    const allVms = filter(this._getAllRunningVms(), vm => vm.$container in idToHost)
     const taggedHosts = Object.values(this._getAntiAffinityTaggedHosts(allHosts, allVms))
 
     // 1. Check if we must migrate VMs...
